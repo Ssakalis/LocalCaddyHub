@@ -500,8 +500,14 @@ test('proxy: actual API validation preserves SQLite and Caddyfile after real Cad
   const base = `http://127.0.0.1:${port}`;
   await until(async () => { if (app.exitCode !== null) assert.fail(output); try { return (await fetch(base + '/login.html')).ok; } catch { return false; } }, 'Actual API did not start');
   let cookie;
-  const api = (endpoint, body) => fetch(base + endpoint, { ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
-    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...(cookie ? { Cookie: cookie } : {}) } });
+  const api = async (endpoint, body) => {
+    const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...(cookie ? { Cookie: cookie } : {}) };
+    if (body && endpoint.startsWith('/api/config')) {
+      const current = await fetch(base + '/api/config/structured', { headers });
+      headers['If-Match'] = current.headers.get('etag');
+    }
+    return fetch(base + endpoint, { ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}), headers });
+  };
   const login = await api('/login', { username: 'bootstrap-api', password: 'bootstrap-api-secret' });
   assert.equal(login.status, 200); cookie = login.headers.get('set-cookie').split(';')[0];
   const setup = await api('/api/setup', { newUsername: 'api-operator', newPassword: 'api-validation-secret' });
@@ -515,7 +521,7 @@ test('proxy: actual API validation preserves SQLite and Caddyfile after real Cad
   const Database = require(path.join(root, 'node_modules/better-sqlite3'));
   const db = new Database(path.join(dir, 'caddyhub.db'), { readonly: true });
   t.after(() => db.close());
-  const snapshot = () => ['general_config', 'domains', 'subdomains', 'handlers', 'access_lists', 'basic_auths', 'headers', 'layer4']
+  const snapshot = () => ['general_config', 'domains', 'subdomains', 'handlers', 'access_lists', 'basic_auths', 'headers', 'layer4', 'config_state']
     .map(table => db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
   const records = snapshot();
   const invalidRaw = await api('/api/config', { content: '{\ninvalid_global_directive yes\n}\n' });

@@ -12,6 +12,8 @@ test('served interface preserves edits, validates forms and renders untrusted va
         if (req.url.startsWith('/api/')) {
             const data = req.url === '/api/config/structured' ? {} : req.url === '/api/config' ? { content: '# Test Caddyfile' } : [];
             res.setHeader('Content-Type', 'application/json');
+            res.setHeader('ETag', '"browser-fixture"');
+            res.setHeader('X-Config-Mode', 'structured');
             res.end(JSON.stringify(data));
             return;
         }

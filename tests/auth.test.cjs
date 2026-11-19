@@ -1,22 +1,52 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert');
 const nodeModule = require('module');
+const sessions = new Map();
 
 // Keep authentication unit tests from initializing real application storage.
 const originalRequire = nodeModule.prototype.require;
 nodeModule.prototype.require = function(name) {
   if (name === './db') {
     return {
-      prepare: () => ({
-        get: () => ({}),
-        run: () => ({})
+      prepare: sql => ({
+        get: token => sql.includes('FROM sessions') ? sessions.get(token) : { id: 1 },
+        run: token => sessions.delete(token)
       })
     };
   }
   return originalRequire.apply(this, arguments);
 };
 
-const { authMiddleware, csrfMiddleware } = require('../src/auth');
+const { authMiddleware, csrfMiddleware, isSessionValid, subscribeSessionRevocation, revokeSessionStreams } = require('../src/auth');
+nodeModule.prototype.require = originalRequire;
+
+describe('session lifetime', () => {
+  test('expires and removes a session at its exact deadline', t => {
+    t.mock.method(Date, 'now', () => 1000);
+    sessions.set('expiring', { expires_at: 1001 });
+    assert.equal(isSessionValid('expiring'), true);
+    t.mock.method(Date, 'now', () => 1001);
+    assert.equal(isSessionValid('expiring'), false);
+    assert.equal(sessions.has('expiring'), false);
+    assert.equal(isSessionValid('missing'), false);
+  });
+
+  test('notifies only subscribed streams and releases disconnected subscriptions', () => {
+    const received = [];
+    const removeA = subscribeSessionRevocation('a', () => received.push('a'));
+    const removeB = subscribeSessionRevocation('b', () => received.push('b'));
+    const removeDisconnected = subscribeSessionRevocation('a', () => received.push('disconnected'));
+    removeDisconnected();
+    revokeSessionStreams('a');
+    assert.deepEqual(received, ['a']);
+    removeA();
+    revokeSessionStreams();
+    assert.deepEqual(received, ['a', 'b']);
+    removeB();
+    revokeSessionStreams();
+    assert.deepEqual(received, ['a', 'b']);
+  });
+});
 
 const mockRes = () => {
   const res = {};

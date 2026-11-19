@@ -65,6 +65,11 @@ async function authenticatedApp(t) {
   return app;
 }
 
+async function configurationHeaders(app) {
+  const response = await fetch(app.base + '/api/config/structured', { headers: app.headers });
+  return { ...app.headers, 'If-Match': response.headers.get('etag') };
+}
+
 function configWithDomain(name) {
   return { general: { enabled: false, http_port: '8080', https_port: '8443' },
     domains: [{ id: 'domain', enabled: false, fromDomain: name }],
@@ -85,10 +90,10 @@ test('TOTP failures are subject to the login lockout', async t => {
 
 test('malformed configuration is rejected without losing the saved configuration', async t => {
   const app = await authenticatedApp(t);
-  const saved = await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify(configWithDomain('saved.example')) });
+  const saved = await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(configWithDomain('saved.example')) });
   assert.equal(saved.status, 200);
   const oldFile = await fs.readFile(path.join(app.dir, 'Caddyfile'), 'utf8');
-  const response = await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify({ general: {}, domains: 'not-an-array' }) });
+  const response = await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify({ general: {}, domains: 'not-an-array' }) });
   assert.equal(response.status, 400);
   const loaded = await (await fetch(`${app.base}/api/config/structured`, { headers: app.headers })).json();
   assert.equal(loaded.domains[0].fromDomain, 'saved.example');
@@ -100,7 +105,7 @@ test('dangling access and authentication references cannot silently remove prote
   for (const field of ['accesslist', 'basicauth']) {
     const config = configWithDomain('protected.example');
     config.domains[0][field] = ['missing-rule'];
-    const response = await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify(config) });
+    const response = await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(config) });
     assert.equal(response.status, 400, field);
     const loaded = await (await fetch(`${app.base}/api/config/structured`, { headers: app.headers })).json();
     assert.equal(loaded.domains.length, 0);
@@ -110,10 +115,13 @@ test('dangling access and authentication references cannot silently remove prote
 test('a failed Caddyfile replacement does not commit new database configuration', async t => {
   const app = await authenticatedApp(t);
   const endpoint = `${app.base}/api/config/structured`;
-  assert.equal((await fetch(endpoint, { method: 'POST', headers: app.headers, body: JSON.stringify(configWithDomain('saved.example')) })).status, 200);
+  assert.equal((await fetch(endpoint, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(configWithDomain('saved.example')) })).status, 200);
+  const headers = await configurationHeaders(app);
   await fs.rename(path.join(app.dir, 'Caddyfile'), path.join(app.dir, 'previous-Caddyfile'));
   await fs.mkdir(path.join(app.dir, 'Caddyfile'));
-  assert.equal((await fetch(endpoint, { method: 'POST', headers: app.headers, body: JSON.stringify(configWithDomain('replacement.example')) })).status, 500);
+  assert.equal((await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(configWithDomain('replacement.example')) })).status, 500);
+  await fs.rmdir(path.join(app.dir, 'Caddyfile'));
+  await fs.rename(path.join(app.dir, 'previous-Caddyfile'), path.join(app.dir, 'Caddyfile'));
   const loaded = await (await fetch(endpoint, { headers: app.headers })).json();
   assert.equal(loaded.domains[0].fromDomain, 'saved.example');
 });
@@ -170,10 +178,13 @@ test('certificate reference cleanup rolls back when the Caddyfile cannot be repl
   const app = await authenticatedApp(t);
   const config = configWithDomain('saved.example');
   config.domains[0].customCert = 'missing.pem';
-  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify(config) })).status, 200);
+  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(config) })).status, 200);
+  const headers = await configurationHeaders(app);
   await fs.rename(path.join(app.dir, 'Caddyfile'), path.join(app.dir, 'previous-Caddyfile'));
   await fs.mkdir(path.join(app.dir, 'Caddyfile'));
-  assert.equal((await fetch(`${app.base}/api/certs/references/cleanup`, { method: 'POST', headers: app.headers, body: '{}' })).status, 500);
+  assert.equal((await fetch(`${app.base}/api/certs/references/cleanup`, { method: 'POST', headers, body: '{}' })).status, 500);
+  await fs.rmdir(path.join(app.dir, 'Caddyfile'));
+  await fs.rename(path.join(app.dir, 'previous-Caddyfile'), path.join(app.dir, 'Caddyfile'));
   const loaded = await (await fetch(`${app.base}/api/config/structured`, { headers: app.headers })).json();
   assert.equal(loaded.domains[0].customCert, 'missing.pem');
 });
@@ -182,8 +193,8 @@ test('renew-all without managed certificates leaves the selected key type untouc
   const app = await authenticatedApp(t);
   const config = configWithDomain('saved.example');
   config.general.tls_key_type = 'p256';
-  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify(config) })).status, 200);
-  assert.equal((await fetch(`${app.base}/api/certs/letsencrypt/renew-all-rsa`, { method: 'POST', headers: app.headers, body: '{}' })).status, 404);
+  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(config) })).status, 200);
+  assert.equal((await fetch(`${app.base}/api/certs/letsencrypt/renew-all-rsa`, { method: 'POST', headers: await configurationHeaders(app), body: '{}' })).status, 404);
   const loaded = await (await fetch(`${app.base}/api/config/structured`, { headers: app.headers })).json();
   assert.equal(loaded.general.tls_key_type, 'p256');
 });
@@ -192,12 +203,12 @@ test('Exchange WAF profile and bounded request limit survive a configuration rou
   const app = await authenticatedApp(t);
   const config = configWithDomain('saved.example');
   config.handlers.push({ id: 'exchange', reverse: 'domain', enabled: false, waf_enabled: true, waf_profile: 'exchange', waf_body_limit_mb: 128 });
-  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify(config) })).status, 200);
+  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(config) })).status, 200);
   const loaded = await (await fetch(`${app.base}/api/config/structured`, { headers: app.headers })).json();
   assert.equal(loaded.handlers[0].waf_profile, 'exchange');
   assert.equal(loaded.handlers[0].waf_body_limit_mb, 128);
   config.handlers[0].waf_body_limit_mb = 0.5;
-  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: app.headers, body: JSON.stringify(config) })).status, 400);
+  assert.equal((await fetch(`${app.base}/api/config/structured`, { method: 'POST', headers: await configurationHeaders(app), body: JSON.stringify(config) })).status, 400);
 });
 
 test('setting credentials rotates the current session and revokes every previous session', async t => {
@@ -293,12 +304,12 @@ test('enabling and disabling TOTP rotates the session and revokes older cookies'
     assert.equal((await fetch(`${app.base}/api/2fa/status`, { headers: { Cookie } })).status, 401);
   }
   const secondMfa = await login(app.base, { username: 'operator', password: 'a-new-secure-password', totp: generateSync({ secret }) });
-  assert.equal(secondMfa.status, 200);
+  assert.equal(secondMfa.status, 401, 'the MFA enrollment code is already consumed');
   const disabled = await fetch(`${app.base}/api/2fa/disable`, { method: 'POST', headers: { ...app.headers, Cookie: enabledCookie } });
   assert.equal(disabled.status, 200);
   const disabledCookie = disabled.headers.get('set-cookie')?.split(';')[0];
   assert.ok(disabledCookie, 'disabling TOTP must issue a fresh session');
-  for (const Cookie of [enabledCookie, secondMfa.headers.get('set-cookie').split(';')[0]]) {
+  for (const Cookie of [enabledCookie, secondCookie]) {
     assert.equal((await fetch(`${app.base}/api/2fa/status`, { headers: { Cookie } })).status, 401);
   }
   const status = await fetch(`${app.base}/api/2fa/status`, { headers: { Cookie: disabledCookie } });
