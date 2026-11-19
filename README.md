@@ -136,6 +136,10 @@ The generic WAF body limit defaults to **12.5 MiB**; the Exchange profile defaul
 
 Saving configuration requires a working custom Caddy binary; invalid changes preserve the previous database and Caddyfile. State directories and private files are restricted to the application account; run the application and its Caddy process as the same OS user (including externally managed Caddy). Changes saved in the UI generate/validate configuration; apply/reload it through the process controls. Coraza WAF rules require application-specific acceptance testing, especially for Exchange request bodies and long-lived connections. A healthy HTTP process or a successful generic proxy smoke test does not demonstrate Outlook, Extended Protection or DAG failover compatibility.
 
+Configuration JSON has a **2 MiB UTF-8 limit**, including the expanded structured representation returned by GET. Other JSON endpoints retain their 100 KiB limit. Configuration reads return a shared strong `ETag` and `X-Config-Mode: structured|raw`; configuration replacements, RSA changes and reference cleanup require that exact revision in `If-Match` (428 if absent, 412 if stale). The UI keeps local edits on conflict. API clients must read before writing. Raw files and external edits are protected against automatic regeneration; replacing them from the structured UI requires explicit confirmation. Legacy files are adopted as structured only when they exactly match the generator or the empty bundled default. See [the repair record](docs/review-fixes-2026-11.md) for the contract and conservative certificate-deletion checks.
+
+Successful TOTP enrollment or login consumes that authenticator time step. Another login must use a later code; restarting the app does not reset this protection. Existing TOTP secrets and accounts are retained.
+
 ## Exchange and redundant proxies
 
 For a KEMP replacement in front of Exchange mailbox servers, read the [Exchange deployment guide](docs/exchange.md) before configuring upstreams. It covers virtual-directory health checks, NTLM, HTTPS bridging and Extended Protection prerequisites.

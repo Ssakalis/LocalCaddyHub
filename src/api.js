@@ -9,6 +9,7 @@ const { parseJSON, isSafeFilename, asyncHandler } = require('./utils');
 const { generateCaddyfile } = require('./caddy');
 const appPaths = require('./paths');
 const { resolveCaddyBinary } = require('./caddyBinary');
+const { CONFIG_JSON_LIMIT } = require('./configLimits');
 
 const router = express.Router();
 
@@ -30,11 +31,72 @@ function serializeConfigWrite(operation) {
 }
 const configHandler = handler => (req, res, next) => serializeConfigWrite(() => handler(req, res, next)).catch(next);
 
-async function persistCaddyfile(content, commit = install => install()) {
+const getConfigStateStmt = db.prepare('SELECT * FROM config_state WHERE id=1');
+const saveConfigStateStmt = db.prepare('INSERT INTO config_state(id, mode, file_hash, version) VALUES(1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET mode=excluded.mode, file_hash=excluded.file_hash, version=excluded.version');
+const deleteConfigStateStmt = db.prepare('DELETE FROM config_state WHERE id=1');
+const fingerprint = value => crypto.createHash('sha256').update(value).digest('hex');
+function configError(status, message) { const error = new Error(message); error.status = status; return error; }
+
+function configurationState() {
+  return db.transaction(() => {
+    let content = null;
+    try { content = fs.readFileSync(appPaths.caddyfile, 'utf8'); }
+    catch (err) { if (err.code !== 'ENOENT') throw err; }
+    const model = structuredConfigFromDb();
+    const saved = getConfigStateStmt.get();
+    const fileHash = fingerprint(JSON.stringify(content));
+    const pristineDefault = content === '{\n\thttp_port 80\n\thttps_port 443\n}\n' && !model.general.enabled &&
+      ['domains', 'subdomains', 'handlers', 'accessLists', 'basicAuths', 'headers', 'layer4'].every(name => !model[name].length);
+    // Only byte-identical generated legacy files can be adopted without an explicit mode choice.
+    let generatedMatch = false;
+    if (!saved && content !== null && !pristineDefault) {
+      try { generatedMatch = content === generateCaddyfile(model, certDir, appPaths.logsDir); }
+      catch { /* Invalid legacy rows cannot establish structured ownership. */ }
+    }
+    const mode = saved ? (saved.file_hash === fileHash ? saved.mode : 'raw') :
+      (content === null || pristineDefault || generatedMatch ? 'structured' : 'raw');
+    const etag = '"' + fingerprint(JSON.stringify([saved?.version || 0, mode, fileHash, model])) + '"';
+    return { content, fileHash, mode, etag, model, saved, tlsKeyType: getGeneralStmt.get()?.tls_key_type, version: saved?.version || 0 };
+  })();
+}
+
+function configHeaders(res, state = configurationState()) {
+  res.setHeader('ETag', state.etag);
+  res.setHeader('X-Config-Mode', state.mode);
+  res.setHeader('Cache-Control', 'no-store');
+  return state;
+}
+
+function requireConfigRevision(req) {
+  if (!req.headers['if-match']) throw configError(428, 'Read the configuration first and supply its ETag in If-Match');
+  const state = configurationState();
+  if (req.headers['if-match'] !== state.etag) throw configError(412, 'Configuration changed. Your draft was not saved; reload and reconcile your changes.');
+  return state;
+}
+
+function requireStructured(state) {
+  if (state.mode !== 'structured') throw configError(409, 'The Caddyfile is raw or was changed externally. This action cannot safely regenerate it from the structured model.');
+}
+
+function checkConfigSize(value) {
+  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > CONFIG_JSON_LIMIT) throw configError(413, 'Configuration exceeds the 2 MiB JSON limit, including its expanded GET representation');
+}
+
+function caddyfileIdentity() {
+  try {
+    const stat = fs.lstatSync(appPaths.caddyfile);
+    return JSON.stringify([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs]);
+  } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
+
+async function persistCaddyfile(content, commit = install => install(), expected, mode = 'structured') {
+  checkConfigSize({ content });
   const destination = appPaths.caddyfile;
   const staged = `${destination}.${crypto.randomUUID()}.tmp`;
   let previous;
   let installed = false;
+  let installedIdentity;
+  let installedState;
   try {
     try { previous = await fs.promises.readFile(destination); }
     catch (err) { if (err.code !== 'ENOENT') throw err; }
@@ -45,21 +107,80 @@ async function persistCaddyfile(content, commit = install => install()) {
       err.status = err.code === 'ENOENT' ? 503 : 400;
       throw err;
     }
-    commit(() => {
-      fs.renameSync(staged, destination);
-      installed = true;
-    });
+    db.transaction(() => {
+      if (expected && configurationState().etag !== expected.etag) throw configError(412, 'Configuration changed during validation; no changes were saved');
+      try {
+        saveConfigStateStmt.run(mode, fingerprint(JSON.stringify(content)), (expected?.version || 0) + 1);
+        commit(() => {
+          fs.renameSync(staged, destination);
+          installed = true;
+          installedIdentity = caddyfileIdentity();
+        });
+        installedState = configurationState();
+      } catch (err) {
+        // Restore before releasing SQLite's writer lock so another writer cannot be overwritten.
+        if (installed) {
+          if (previous === undefined) fs.unlinkSync(destination);
+          else {
+            fs.writeFileSync(staged, previous, { mode: 0o600 });
+            fs.renameSync(staged, destination);
+          }
+          installed = false;
+        }
+        throw err;
+      }
+    }).immediate();
+    return installedState;
   } catch (err) {
     if (installed) {
-      if (previous === undefined) await fs.promises.unlink(destination);
-      else {
-        await fs.promises.writeFile(staged, previous, { mode: 0o600 });
-        await fs.promises.rename(staged, destination);
-      }
+      db.transaction(() => {
+        const current = configurationState();
+        if (caddyfileIdentity() !== installedIdentity || JSON.stringify(current.saved) !== JSON.stringify(expected.saved) ||
+          JSON.stringify(current.model) !== JSON.stringify(expected.model)) return;
+        if (previous === undefined) fs.unlinkSync(destination);
+        else {
+          fs.writeFileSync(staged, previous, { mode: 0o600, flag: 'wx' });
+          fs.renameSync(staged, destination);
+        }
+      }).immediate();
     }
     throw err;
   } finally {
     await fs.promises.rm(staged, { force: true });
+  }
+}
+
+function restoreTlsConfiguration(previous, installed) {
+  const staged = `${appPaths.caddyfile}.${crypto.randomUUID()}.rollback`;
+  let restored = false;
+  let restoredIdentity;
+  try {
+    if (previous.content !== null) fs.writeFileSync(staged, previous.content, { mode: 0o600, flag: 'wx' });
+    db.transaction(() => {
+      if (configurationState().etag !== installed.etag) throw configError(412, 'Configuration changed after installation; the newer configuration was preserved');
+      setGeneralTlsKeyTypeStmt.run(previous.tlsKeyType);
+      if (previous.saved) saveConfigStateStmt.run(previous.saved.mode, previous.saved.file_hash, previous.saved.version);
+      else deleteConfigStateStmt.run();
+      if (previous.content === null) fs.unlinkSync(appPaths.caddyfile);
+      else fs.renameSync(staged, appPaths.caddyfile);
+      restoredIdentity = caddyfileIdentity();
+      restored = true;
+    }).immediate();
+  } catch (error) {
+    if (restored) {
+      // A failed SQLite COMMIT restores the installed DB; compensate only our corresponding file.
+      db.transaction(() => {
+        const current = configurationState();
+        if (caddyfileIdentity() === restoredIdentity && JSON.stringify(current.saved) === JSON.stringify(installed.saved) &&
+          JSON.stringify(current.model) === JSON.stringify(installed.model)) {
+          fs.writeFileSync(staged, installed.content, { mode: 0o600, flag: 'wx' });
+          fs.renameSync(staged, appPaths.caddyfile);
+        }
+      }).immediate();
+    }
+    throw error;
+  } finally {
+    fs.rmSync(staged, { force: true });
   }
 }
 
@@ -196,28 +317,26 @@ function normalizeAcmeConfig(input) {
 }
 
 // /api/config
-router.get('/config', async (req, res) => {
+router.get('/config', configHandler(async (req, res) => {
   try {
-    const caddyfilePath = appPaths.caddyfile;
-    let content = '';
-    if (fs.existsSync(caddyfilePath)) {
-      content = await fs.promises.readFile(caddyfilePath, 'utf-8');
-    }
-    res.json({ content });
+    const state = configHeaders(res);
+    res.json({ content: state.content || '' });
   } catch (err) {
     res.status(500).send('Failed to read Caddyfile');
   }
-});
+}));
 
 router.post('/config', express.json(), (req, res, next) => serializeConfigWrite(async () => {
   try {
+    const state = requireConfigRevision(req);
     const { content } = req.body;
     if (typeof content !== 'string') return res.status(400).send('Invalid request body');
-    const caddyfilePath = appPaths.caddyfile;
-    await persistCaddyfile(content);
+    checkConfigSize({ content });
+    const installed = await persistCaddyfile(content, undefined, state, 'raw');
+    configHeaders(res, installed);
     res.sendStatus(200);
   } catch (err) {
-    res.status(err.status || 500).send(err.stderr || 'Failed to write Caddyfile');
+    res.status(err.status || 500).send(err.status === 412 || err.status === 428 ? err.message : err.stderr || err.message || 'Failed to write Caddyfile');
   }
 }).catch(next));
 
@@ -333,14 +452,14 @@ function structuredConfigFromDb() {
 }
 
 // /api/config/structured
-router.get('/config/structured', (req, res) => {
+router.get('/config/structured', configHandler((req, res) => {
   try {
-    res.json(structuredConfigFromDb());
+    res.json(configHeaders(res).model);
   } catch (err) {
     console.error(err);
     res.status(500).send('Failed to read config');
   }
-});
+}));
 
 const updateGeneralStmt = db.prepare('UPDATE general_config SET enabled=?, enable_layer4=?, http_port=?, https_port=?, log_level=?, tls_email=?, acme_ca=?, tls_key_type=?, http_versions=?, timeout_read_body=?, timeout_read_header=?, timeout_write=?, timeout_idle=?, log_credentials=?, auto_https=?, log_roll_size_mb=?, log_roll_keep=? WHERE id=1');
 
@@ -367,7 +486,7 @@ const insertDomainStmt = db.prepare(`
 
 const deleteSubdomainsStmt = db.prepare('DELETE FROM subdomains');
 const insertSubdomainStmt = db.prepare(`
-  INSERT INTO subdomains (id, enabled, reverse, fromDomain, additionalHosts, accesslist, basicauth, description, client_auth_mode, client_auth_trust_pool, acme)
+  INSERT INTO subdomains (id, enabled, reverse, fromDomain, additionalHosts, accesslist, basicauth, description, customCert, client_auth_mode, client_auth_trust_pool, acme)
   SELECT
     json_extract(value, '$.id'),
     json_extract(value, '$.enabled'),
@@ -377,6 +496,7 @@ const insertSubdomainStmt = db.prepare(`
     json_extract(value, '$.accesslist'),
     json_extract(value, '$.basicauth'),
     json_extract(value, '$.description'),
+    json_extract(value, '$.customCert'),
     json_extract(value, '$.client_auth_mode'),
     json_extract(value, '$.client_auth_trust_pool'),
     json_extract(value, '$.acme')
@@ -513,6 +633,7 @@ const insertLayer4Stmt = db.prepare(`
 const clearDomainCustomCertStmt = db.prepare("UPDATE domains SET customCert='' WHERE id=?");
 const clearDomainClientAuthTrustPoolStmt = db.prepare("UPDATE domains SET client_auth_trust_pool='' WHERE id=?");
 const clearSubdomainClientAuthTrustPoolStmt = db.prepare("UPDATE subdomains SET client_auth_trust_pool='' WHERE id=?");
+const clearSubdomainCustomCertStmt = db.prepare("UPDATE subdomains SET customCert='' WHERE id=?");
 const clearHandlerTrustedCaStmt = db.prepare("UPDATE handlers SET http_tls_trusted_ca_certs='' WHERE id=?");
 const clearLayer4CustomCertStmt = db.prepare("UPDATE layer4 SET customCert='' WHERE id=?");
 const setGeneralTlsKeyTypeStmt = db.prepare('UPDATE general_config SET tls_key_type=? WHERE id=1');
@@ -521,12 +642,16 @@ function keyNameForCustomCertificate(filename) {
   return String(filename || '').replace(/\.(pem|crt|cer)$/i, '') + '.key';
 }
 
+function certificateFilePath(filename) {
+  return path.resolve(path.join(certDir, filename).replace(/\\/g, '/'));
+}
+
 function certificateReferenceRows() {
   const references = [];
 
   function add(file, type, owner, clearKey, companionOf = '') {
     if (!file) return;
-    references.push({ file, type, owner, clearKey, companionOf });
+    references.push({ file: path.relative(path.resolve(certDir), certificateFilePath(file)), type, owner, clearKey, companionOf });
   }
 
   for (const domain of getDomainsStmt.all()) {
@@ -540,6 +665,10 @@ function certificateReferenceRows() {
 
   for (const subdomain of getSubdomainsStmt.all()) {
     const owner = subdomain.fromDomain || subdomain.id;
+    if (subdomain.customCert) {
+      add(subdomain.customCert, 'Subdomain custom certificate', owner, `subdomain:customCert:${subdomain.id}`);
+      add(keyNameForCustomCertificate(subdomain.customCert), 'Subdomain custom certificate key', owner, `subdomain:customCert:${subdomain.id}`, subdomain.customCert);
+    }
     add(subdomain.client_auth_trust_pool, 'Subdomain client auth trust pool', owner, `subdomain:client_auth_trust_pool:${subdomain.id}`);
   }
 
@@ -559,6 +688,21 @@ function certificateReferenceRows() {
   return references;
 }
 
+function certificateReferencesForFiles(filenames) {
+  const paths = filenames.map(certificateFilePath);
+  const stat = file => {
+    try { return fs.statSync(file); }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null; throw error; }
+  };
+  const targets = paths.map(stat);
+  return certificateReferenceRows().filter(reference => {
+    const file = certificateFilePath(reference.file);
+    if (paths.includes(file)) return true;
+    const source = stat(file);
+    return source && targets.some(target => target && target.dev === source.dev && target.ino === source.ino);
+  });
+}
+
 function clearCertificateReference(clearKey) {
   const [table, field, id] = String(clearKey).split(':');
   if (!table || !field || !id) return false;
@@ -566,6 +710,7 @@ function clearCertificateReference(clearKey) {
   if (table === 'domain' && field === 'customCert') clearDomainCustomCertStmt.run(id);
   else if (table === 'domain' && field === 'client_auth_trust_pool') clearDomainClientAuthTrustPoolStmt.run(id);
   else if (table === 'subdomain' && field === 'client_auth_trust_pool') clearSubdomainClientAuthTrustPoolStmt.run(id);
+  else if (table === 'subdomain' && field === 'customCert') clearSubdomainCustomCertStmt.run(id);
   else if (table === 'handler' && field === 'http_tls_trusted_ca_certs') clearHandlerTrustedCaStmt.run(id);
   else if (table === 'layer4' && field === 'customCert') clearLayer4CustomCertStmt.run(id);
   else return false;
@@ -573,14 +718,15 @@ function clearCertificateReference(clearKey) {
   return true;
 }
 
-async function clearCertificateReferencesForFiles(filenames) {
+async function clearCertificateReferencesForFiles(filenames, state, removeFile = () => {}, missingOnly = false) {
+  requireStructured(state);
   const files = new Set(filenames.filter(Boolean));
   const cleared = [];
   const seen = new Set();
   const config = structuredConfigFromDb();
   const sections = { domain: 'domains', subdomain: 'subdomains', handler: 'handlers', layer4: 'layer4' };
-  for (const reference of certificateReferenceRows()) {
-    if (!files.has(reference.file) || seen.has(reference.clearKey)) continue;
+  for (const reference of certificateReferencesForFiles([...files])) {
+    if (seen.has(reference.clearKey)) continue;
     const [type, field, id] = reference.clearKey.split(':');
     const row = config[sections[type]].find(row => row.id === id);
     if (!row) continue;
@@ -588,38 +734,59 @@ async function clearCertificateReferencesForFiles(filenames) {
     seen.add(reference.clearKey);
     cleared.push(reference);
   }
+  const recheckReferences = () => {
+    const current = new Set(certificateReferencesForFiles([...files]).map(reference => reference.clearKey));
+    if (current.size !== seen.size || [...current].some(key => !seen.has(key))) {
+      throw configError(409, 'Certificate dependencies changed during validation; no references were removed');
+    }
+    if (missingOnly) {
+      const missing = new Set(missingCertificateReferences().map(reference => certificateFilePath(reference.file)));
+      if ([...files].some(file => !missing.has(certificateFilePath(file)))) {
+        throw configError(409, 'A missing certificate dependency was restored during validation; no references were removed');
+      }
+    }
+  };
   if (cleared.length) {
     const tx = db.transaction(install => {
+      recheckReferences();
       for (const reference of cleared) clearCertificateReference(reference.clearKey);
+      removeFile();
       install();
     });
-    await persistCaddyfile(generateCaddyfile(config, certDir, appPaths.logsDir), tx);
+    const installed = await persistCaddyfile(generateCaddyfile(config, certDir, appPaths.logsDir), tx, state);
+    return { cleared, state: installed };
+  } else {
+    db.transaction(() => {
+      if (configurationState().etag !== state.etag) throw configError(412, 'Configuration changed; no references were removed');
+      recheckReferences();
+      removeFile();
+    }).immediate();
   }
-  return cleared;
+  return { cleared, state };
 }
 
-async function setTlsKeyType(keyType) {
+async function setTlsKeyType(keyType, state) {
+  requireStructured(state);
   const config = structuredConfigFromDb();
   config.general.tls_key_type = keyType;
   const tx = db.transaction(install => {
     setGeneralTlsKeyTypeStmt.run(keyType);
     install();
   });
-  await persistCaddyfile(generateCaddyfile(config, certDir, appPaths.logsDir), tx);
+  return persistCaddyfile(generateCaddyfile(config, certDir, appPaths.logsDir), tx, state);
 }
 
-async function existingCustomCertFileSet() {
-  const dirents = await fs.promises.readdir(certDir, { withFileTypes: true });
-  return new Set(dirents.filter(dirent => !dirent.isDirectory()).map(dirent => dirent.name));
-}
-
-async function missingCertificateReferences() {
-  const existingFiles = await existingCustomCertFileSet();
-  return certificateReferenceRows().filter(reference => !existingFiles.has(reference.file));
+function missingCertificateReferences() {
+  return certificateReferenceRows().filter(reference => {
+    try { return !fs.statSync(certificateFilePath(reference.file)).isFile(); }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return true; throw error; }
+  });
 }
 
 router.post('/config/structured', express.json(), (req, res, next) => serializeConfigWrite(async () => {
   try {
+    const state = requireConfigRevision(req);
+    if (req.headers['x-config-mode'] !== 'structured') requireStructured(state);
     validateConfigShape(req.body);
     const config = normalizeAcmeConfig(req.body || {});
 
@@ -710,12 +877,14 @@ router.post('/config/structured', express.json(), (req, res, next) => serializeC
 
       deleteLayer4Stmt.run();
       if (processedLayer4.length > 0) insertLayer4Stmt.run(JSON.stringify(processedLayer4));
+      checkConfigSize(structuredConfigFromDb());
       install();
     });
 
     const caddyfileContent = generateCaddyfile(config, certDir, appPaths.logsDir);
-    await persistCaddyfile(caddyfileContent, saveTransaction);
+    const installed = await persistCaddyfile(caddyfileContent, saveTransaction, state);
 
+    configHeaders(res, installed);
     res.sendStatus(200);
   } catch (err) {
     console.error(err);
@@ -740,58 +909,76 @@ router.get('/logs/files', async (req, res) => {
   }
 });
 
-router.get('/logs/stream', async (req, res) => {
+router.get('/logs/stream', asyncHandler(async (req, res) => {
   const filename = req.query.file;
   if (!isSafeFilename(filename) || !filename.endsWith('.log')) {
     return res.status(400).send('Invalid filename');
   }
 
   const filePath = path.join(logsDir, filename);
-
-  // Set headers for SSE
+  const { isSessionValid, subscribeSessionRevocation } = require('./auth');
+  const token = req.cookies.session;
+  let tail;
+  let timer;
+  let unsubscribe = () => {};
+  let stopped = false;
+  let buffer = '';
+  const close = () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    unsubscribe();
+    if (tail) {
+      tail.stdout.removeListener('data', read);
+      tail.kill();
+    }
+    res.removeListener('close', close);
+    res.removeListener('error', close);
+    if (!res.destroyed && !res.writableEnded) res.end();
+  };
+  const authorized = () => {
+    try { if (isSessionValid(token)) return true; } catch {}
+    close();
+    return false;
+  };
+  const read = data => {
+    if (stopped || !authorized()) return;
+    buffer += data.toString();
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (line.trim()) res.write(`data: ${line}\n\n`);
+    }
+  };
+  res.once('close', close);
+  res.once('error', close);
+  try {
+    await fs.promises.access(filePath, fs.constants.F_OK);
+  } catch (err) {
+    if (!stopped) res.type('text/event-stream').end(`data: ${JSON.stringify({ error: 'Log file not found' })}\n\n`);
+    close();
+    return;
+  }
+  if (stopped || !authorized()) return;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive'
   });
-
-  try {
-    await fs.promises.access(filePath, fs.constants.F_OK);
-  } catch (err) {
-    res.write(`data: ${JSON.stringify({ error: 'Log file not found' })}\n\n`);
-    res.end();
-    return;
-  }
-
-  // Use child_process tail to read the file
-  // 🛡️ Sentinel: Use '--' to ensure filePath is not treated as an option if it starts with a hyphen.
-  const tail = spawn('tail', ['-f', '-n', '100', '--', filePath]);
-  tail.on('error', () => {
-    res.end(`data: ${JSON.stringify({ error: 'Failed to start log reader' })}\n\n`);
+  res.flushHeaders();
+  unsubscribe = subscribeSessionRevocation(token, close);
+  // Check quiet streams too, including revocations committed by another app process.
+  timer = setInterval(authorized, 250);
+  timer.unref();
+  tail = spawn('tail', ['-F', '-n', '100', '--', filePath]);
+  tail.once('error', () => {
+    if (!stopped && authorized()) res.write(`data: ${JSON.stringify({ error: 'Failed to start log reader' })}\n\n`);
+    close();
   });
-
-  let buffer = '';
-
-  tail.stdout.on('data', (data) => {
-    buffer += data.toString();
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // The last element is the remainder of an incomplete line
-
-    lines.forEach(line => {
-      if (line.trim()) {
-        res.write(`data: ${line}\n\n`);
-      }
-    });
-  });
-
-  tail.stderr.on('data', (data) => {
-    console.error(`Tail error: ${data.toString()}`);
-  });
-
-  res.on('close', () => {
-    tail.kill();
-  });
-});
+  tail.once('exit', close);
+  tail.stdout.on('data', read);
+  tail.stderr.resume();
+}));
 
 // Exec Caddy commands
 function execCaddy(cmdArgs, res) {
@@ -1427,14 +1614,22 @@ router.post('/certs/letsencrypt/renew', express.json(), configHandler(async (req
 
 router.post('/certs/letsencrypt/renew-all-rsa', express.json(), configHandler(async (req, res) => {
   try {
+    const state = requireConfigRevision(req);
+    requireStructured(state);
     const certificates = (await listPfxCertificates()).filter(pair => pair.renewable);
     if (certificates.length === 0) return res.status(404).json({ error: 'No Caddy-managed ACME certificates found' });
-    await setTlsKeyType('rsa2048');
-    const output = await reloadOrStartCaddy();
+    const installed = await setTlsKeyType('rsa2048', state);
+    let output;
+    try { output = await reloadOrStartCaddy(); }
+    catch (error) {
+      restoreTlsConfiguration(state, installed);
+      throw error;
+    }
+    configHeaders(res, installed);
     res.json({ output: `RSA 2048 configured for future issuances and automatic renewals. Existing certificates were preserved. ${output}`,
       stderr: '', certificates: certificates.map(publicPfxCertificate) });
   } catch (err) {
-    res.status(500).json({ output: err.stdout || '', stderr: err.stderr || '', error: err.message });
+    res.status(err.status || 500).json({ output: err.stdout || '', stderr: err.stderr || '', error: err.message });
   }
 }));
 
@@ -1499,11 +1694,14 @@ router.get('/certs/references/missing', async (req, res) => {
 
 router.post('/certs/references/cleanup', express.json(), configHandler(async (req, res) => {
   try {
+    const state = requireConfigRevision(req);
+    requireStructured(state);
     const missing = await missingCertificateReferences();
-    const cleared = await clearCertificateReferencesForFiles(missing.map(reference => reference.file));
-    res.json({ missing, cleared });
+    const result = await clearCertificateReferencesForFiles(missing.map(reference => reference.file), state, undefined, true);
+    configHeaders(res, result.state);
+    res.json({ missing, cleared: result.cleared });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 }));
 
@@ -1519,35 +1717,80 @@ router.get('/certs/acme/download', async (req, res) => {
 
 async function serveCertificates(certificatesDir, res) {
   try {
-    await fs.promises.access(certificatesDir, fs.constants.F_OK);
+    const directory = await fs.promises.lstat(certificatesDir);
+    if (!directory.isDirectory()) throw new Error('Invalid certificate directory');
   } catch (err) {
-    return res.status(404).send('No Caddy-managed ACME certificates found.');
+    return res.status(err.code === 'ENOENT' ? 404 : 500).send('No Caddy-managed ACME certificates found.');
   }
 
-  res.setHeader('Content-Type', 'application/gzip');
-  res.setHeader('Content-Disposition', 'attachment; filename="caddy-acme-certificates.tar.gz"');
-
-  const tarProcess = spawn('tar', ['-czf', '-', '-C', certificatesDir, '.']);
-    tarProcess.on('error', error => {
-      if (!res.headersSent) res.status(500).end('Failed to start certificate archive');
-      else res.destroy(error);
-    });
-    res.on('close', () => tarProcess.kill());
-
-  tarProcess.stdout.pipe(res);
-
-  tarProcess.stderr.on('data', (data) => {
-    console.error(`tar stderr: ${data}`);
-  });
-
-  tarProcess.on('close', (code) => {
-    if (code !== 0) {
-      console.error(`tar process exited with code ${code}`);
-      if (!res.headersSent) {
-        res.status(500).end();
+  let workspace;
+  let tarProcess;
+  const stopArchive = () => tarProcess?.kill();
+  res.once('close', stopArchive);
+  try {
+    const members = [];
+    const sourceStates = new Map();
+    const fileState = stat => [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
+    async function checkPairs(directory) {
+      const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+      const keys = new Set(entries.filter(entry => entry.isFile() && /\.key$/i.test(entry.name))
+        .map(entry => entry.name.replace(/\.key$/i, '').toLowerCase()));
+      const certificates = new Set(entries.filter(entry => entry.isFile() && /\.(crt|pem|cer)$/i.test(entry.name))
+        .map(entry => entry.name.replace(/\.(crt|pem|cer)$/i, '').toLowerCase()));
+      for (const entry of entries) {
+        if (res.destroyed) throw new Error('Download closed');
+        if (entry.isDirectory()) await checkPairs(path.join(directory, entry.name));
+        else if (!entry.isFile()) throw new Error('Certificate storage contains a link or special file');
+        else if (/\.(crt|pem|cer)$/i.test(entry.name) && !keys.has(entry.name.replace(/\.(crt|pem|cer)$/i, '').toLowerCase())) {
+          throw new Error('Certificate storage is missing a companion private key');
+        }
+        else if (/\.key$/i.test(entry.name) && !certificates.has(entry.name.replace(/\.key$/i, '').toLowerCase())) {
+          throw new Error('Certificate storage is missing a companion certificate');
+        }
+        else {
+          const file = path.join(directory, entry.name);
+          const stat = await fs.promises.lstat(file);
+          if (!stat.isFile()) throw new Error('Certificate storage changed during inspection');
+          sourceStates.set(file, fileState(stat));
+          members.push(`./${path.relative(certificatesDir, file)}`);
+        }
       }
     }
-  });
+    await checkPairs(certificatesDir);
+    if (res.destroyed) return;
+    workspace = await fs.promises.mkdtemp(path.join(path.dirname(appPaths.db), '.certificate-archive-'));
+    const archive = path.join(workspace, 'certificates.tar.gz');
+    const manifest = path.join(workspace, 'members');
+    await fs.promises.writeFile(archive, '', { mode: 0o600, flag: 'wx' });
+    // An explicit list makes tar fail if a scanned key disappears before it is read.
+    await fs.promises.writeFile(manifest, members.map(member => `${member}\0`).join(''), { mode: 0o600, flag: 'wx' });
+    if (res.destroyed) return;
+    await new Promise((resolve, reject) => {
+      tarProcess = spawn('tar', ['-czf', archive, '-C', certificatesDir, '--null', '-T', manifest], { stdio: 'ignore' });
+      tarProcess.once('error', reject);
+      tarProcess.once('close', code => code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)));
+    });
+    tarProcess = null;
+    if (res.destroyed) return;
+    for (const [file, state] of sourceStates) {
+      const stat = await fs.promises.lstat(file);
+      if (!stat.isFile() || fileState(stat) !== state) throw new Error('Certificate storage changed during archive creation');
+    }
+    if ((await fs.promises.stat(archive)).size === 0) throw new Error('Certificate archive is empty');
+    await new Promise((resolve, reject) => {
+      res.download(archive, 'caddy-acme-certificates.tar.gz', {
+        headers: { 'Content-Type': 'application/gzip', 'Cache-Control': 'no-store' }
+      }, error => error ? reject(error) : resolve());
+    });
+  } catch (error) {
+    if (!res.destroyed) {
+      if (res.headersSent) res.destroy(error);
+      else res.status(500).send('Failed to create certificate archive');
+    }
+  } finally {
+    res.off('close', stopArchive);
+    if (workspace) await fs.promises.rm(workspace, { recursive: true, force: true });
+  }
 }
 
 
@@ -1591,30 +1834,57 @@ router.delete('/certs', configHandler(async (req, res) => {
     return res.status(400).send('Invalid filename');
   }
   const removeReferences = req.query.removeReferences === '1';
-  const references = certificateReferenceRows().filter(reference => reference.file === filename);
-  if (references.length > 0 && !removeReferences) {
-    return res.status(409).json({
-      error: 'Certificate is still referenced by the configuration',
-      references
-    });
-  }
-
   const filePath = path.join(certDir, filename);
+  const removedPath = path.join(certDir, `.deleted-${crypto.randomUUID()}`);
+  let moved = false;
+  let committed = false;
   try {
-    let clearedReferences = [];
-    if (removeReferences) {
-      clearedReferences = await clearCertificateReferencesForFiles([filename]);
+    const file = fs.lstatSync(filePath);
+    if (!file.isFile() && !file.isSymbolicLink()) throw configError(400, 'Certificate selection is not a file');
+    const state = removeReferences ? requireConfigRevision(req) : configurationState();
+    let assertRawUnchanged = () => {};
+    if (state.mode === 'raw') {
+      assertRawUnchanged = await require('./rawReferences').assertRawFileUnused(state.content || '', filename, {
+        certDir, caddyfile: appPaths.caddyfile, execCaddy: execCaddyPromise
+      });
     }
-
-    // ⚡ Bolt: Use asynchronous unlink to prevent event loop blocking,
-    // and catch ENOENT instead of using existsSync to avoid TOCTOU races.
-    await fs.promises.unlink(filePath);
+    const references = certificateReferencesForFiles([filename]);
+    if (references.length > 0 && !removeReferences) return res.status(409).json({ error: 'Certificate is still referenced by the configuration', references });
+    const removeFile = () => {
+      assertRawUnchanged();
+      fs.renameSync(filePath, removedPath);
+      moved = true;
+    };
+    let clearedReferences = [];
+    let writtenState = state;
+    if (removeReferences) {
+      const result = await clearCertificateReferencesForFiles([filename], state, removeFile);
+      clearedReferences = result.cleared;
+      writtenState = result.state;
+    } else {
+      db.transaction(() => {
+        if (configurationState().etag !== state.etag) throw configError(412, 'Configuration changed; the file was not deleted');
+        removeFile();
+      }).immediate();
+    }
+    committed = true;
+    await fs.promises.unlink(removedPath).catch(err => console.error('Failed to remove private certificate tombstone:', err.message));
+    configHeaders(res, writtenState);
     res.json({ deleted: true, clearedReferences });
   } catch (err) {
+    if (moved && !committed) {
+      try {
+        fs.linkSync(removedPath, filePath);
+        fs.unlinkSync(removedPath);
+      } catch (restoreError) {
+        err = configError(restoreError.code === 'EEXIST' ? 409 : 500,
+          `Certificate rollback could not reclaim its filename. Existing files were preserved; the previous file remains as ${path.basename(removedPath)}`);
+      }
+    }
     if (err.code === 'ENOENT') {
       res.status(404).send('File not found');
     } else {
-      res.status(500).send('Failed to delete file');
+      res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to delete file' });
     }
   }
 }));

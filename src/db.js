@@ -8,6 +8,13 @@ const db = new Database(appPaths.db);
 db.pragma('journal_mode = WAL');
 
 const SCHEMA_SQL = `
+    CREATE TABLE IF NOT EXISTS config_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      mode TEXT NOT NULL CHECK (mode IN ('structured', 'raw')),
+      file_hash TEXT NOT NULL,
+      version INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS general_config (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       enabled INTEGER DEFAULT 0,
@@ -55,6 +62,7 @@ const SCHEMA_SQL = `
       accesslist TEXT, -- JSON array
       basicauth TEXT, -- JSON array
       description TEXT,
+      customCert TEXT,
       client_auth_mode TEXT,
       client_auth_trust_pool TEXT,
       acme INTEGER DEFAULT 0
@@ -166,7 +174,8 @@ const SCHEMA_SQL = `
       username TEXT NOT NULL,
       password_hash TEXT NOT NULL,
       totp_secret TEXT,
-      totp_enabled INTEGER DEFAULT 0
+      totp_enabled INTEGER DEFAULT 0,
+      totp_last_step INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS sessions (
@@ -194,6 +203,7 @@ function initGeneralConfig() {
 function runMigrations() {
   // Perform schema migrations for existing databases
   const migrations = [
+    { table: 'users', column: 'totp_last_step', def: 'INTEGER' },
 	    { table: 'general_config', column: 'tls_email', def: 'TEXT' },
 	    { table: 'general_config', column: 'acme_ca', def: 'TEXT' },
 	    { table: 'general_config', column: 'tls_key_type', def: "TEXT DEFAULT 'rsa2048'" },
@@ -212,6 +222,7 @@ function runMigrations() {
     { table: 'subdomains', column: 'client_auth_mode', def: 'TEXT' },
     { table: 'subdomains', column: 'client_auth_trust_pool', def: 'TEXT' },
     { table: 'subdomains', column: 'additionalHosts', def: 'TEXT' },
+    { table: 'subdomains', column: 'customCert', def: 'TEXT' },
     { table: 'domains', column: 'acme', def: 'INTEGER DEFAULT 0' },
     { table: 'subdomains', column: 'acme', def: 'INTEGER DEFAULT 0' },
     { table: 'handlers', column: 'to_path', def: 'TEXT' },

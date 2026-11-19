@@ -5,9 +5,36 @@ const db = require('./db');
 const getSessionStmt = db.prepare('SELECT expires_at FROM sessions WHERE token = ?');
 const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE token = ?');
 const getFirstUserStmt = db.prepare('SELECT id FROM users WHERE id = 1');
+const sessionStreams = new Map();
 
 function generateSessionToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+function isSessionValid(token) {
+  if (!token) return false;
+  const session = getSessionStmt.get(token);
+  if (!session) return false;
+  if (Date.now() < session.expires_at) return true;
+  deleteSessionStmt.run(token);
+  return false;
+}
+
+function subscribeSessionRevocation(token, close) {
+  if (!sessionStreams.has(token)) sessionStreams.set(token, new Set());
+  const streams = sessionStreams.get(token);
+  streams.add(close);
+  return () => {
+    streams.delete(close);
+    if (streams.size === 0) sessionStreams.delete(token);
+  };
+}
+
+function revokeSessionStreams(token) {
+  const streams = token ? [sessionStreams.get(token)] : [...sessionStreams.values()];
+  for (const listeners of streams) {
+    for (const close of [...(listeners || [])]) close();
+  }
 }
 
 function authMiddleware(req, res, next) {
@@ -17,21 +44,7 @@ function authMiddleware(req, res, next) {
   }
 
   const token = req.cookies.session;
-  let valid = false;
-
-  if (token) {
-    const session = getSessionStmt.get(token);
-
-    if (session) {
-      if (Date.now() < session.expires_at) {
-        valid = true;
-      } else {
-        deleteSessionStmt.run(token);
-      }
-    }
-  }
-
-  if (!valid) {
+  if (!isSessionValid(token)) {
     if (req.path.toLowerCase().startsWith('/api/')) {
       return res.status(401).send('Unauthorized');
     } else {
@@ -64,4 +77,7 @@ module.exports = {
   generateSessionToken,
   authMiddleware,
   csrfMiddleware,
+  isSessionValid,
+  subscribeSessionRevocation,
+  revokeSessionStreams,
 };

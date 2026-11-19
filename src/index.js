@@ -14,7 +14,7 @@ const bcrypt = require('bcrypt');
 
 const { generateSecret, verifySync, generateURI } = require('otplib');
 const qrcode = require('qrcode');
-const { generateSessionToken, authMiddleware, csrfMiddleware } = require('./auth');
+const { generateSessionToken, authMiddleware, csrfMiddleware, revokeSessionStreams } = require('./auth');
 const { safeCompare, asyncHandler } = require('./utils');
 const { loginRateLimiter, clearAttempts } = require('./rateLimiter');
 const apiRoutes = require('./api');
@@ -31,8 +31,9 @@ const getSessionStmt = db.prepare('SELECT expires_at FROM sessions WHERE token =
 const updateUserAuthStmt = db.prepare('UPDATE users SET username=?, password_hash=? WHERE id=1');
 const insertUserAuthStmt = db.prepare('INSERT INTO users (id, username, password_hash) VALUES (1, ?, ?)');
 const getUsernameStmt = db.prepare('SELECT username FROM users WHERE id = 1');
-const updateTotpSecretStmt = db.prepare('UPDATE users SET totp_secret=?, totp_enabled=1 WHERE id=1');
-const disableTotpStmt = db.prepare('UPDATE users SET totp_secret=NULL, totp_enabled=0 WHERE id=1');
+const updateTotpSecretStmt = db.prepare('UPDATE users SET totp_secret=?, totp_enabled=1, totp_last_step=? WHERE id=1');
+const disableTotpStmt = db.prepare('UPDATE users SET totp_secret=NULL, totp_enabled=0, totp_last_step=NULL WHERE id=1');
+const consumeTotpStmt = db.prepare('UPDATE users SET totp_last_step=? WHERE id=1 AND totp_secret=? AND (totp_last_step IS NULL OR totp_last_step < ?)');
 const getTotpEnabledStmt = db.prepare('SELECT totp_enabled FROM users WHERE id = 1');
 
 function setSessionCookie(res, token) {
@@ -53,12 +54,40 @@ const updateAuthentication = db.transaction((currentToken, update) => {
   return token;
 });
 
+function verifyTotp(token, secret, lastStep) {
+  try {
+    return verifySync({ token, secret,
+      ...(lastStep == null ? {} : { afterTimeStep: lastStep }) });
+  } catch {
+    return { valid: false };
+  }
+}
+
+const createLoginSession = db.transaction((userRow, tokenInput) => {
+  // Recheck after bcrypt and reserve the accepted step in the session's transaction.
+  const currentUser = getUserStmt.get();
+  if (Boolean(currentUser) !== Boolean(userRow) || (userRow &&
+    ['username', 'password_hash', 'totp_secret', 'totp_enabled'].some(field => currentUser[field] !== userRow[field]))) {
+    return { error: 'unauthorized' };
+  }
+  if (currentUser?.totp_enabled) {
+    const result = verifyTotp(tokenInput, currentUser.totp_secret, currentUser.totp_last_step);
+    if (!result.valid || !consumeTotpStmt.run(result.timeStep, currentUser.totp_secret, result.timeStep).changes) {
+      return { error: 'invalid_totp' };
+    }
+  }
+  const token = generateSessionToken();
+  insertSessionStmt.run(token, Date.now() + 86400000);
+  return { token };
+});
+
 const app = express();
 const port = process.env.PORT || 8090;
 
 app.disable('x-powered-by'); // 🛡️ Sentinel: Prevent leaking Express version
 
 app.use(express.urlencoded({ extended: true }));
+app.use(['/api/config', '/api/config/structured'], express.json({ limit: require('./configLimits').CONFIG_JSON_LIMIT }));
 app.use(express.json());
 app.use(cookieParser());
 
@@ -97,20 +126,6 @@ app.post('/login', loginRateLimiter, asyncHandler(async (req, res) => {
     const passMatch = await bcrypt.compare(password, userRow.password_hash);
 
     if (userMatch && passMatch) {
-      if (userRow.totp_enabled) {
-        if (!tokenInput) {
-           return rejectLogin('invalid_totp');
-        }
-        let isValid = false;
-        try {
-          isValid = verifySync({ token: tokenInput, secret: userRow.totp_secret }).valid;
-        } catch (err) {
-          // Ignore format errors etc and treat as invalid
-        }
-        if (!isValid) {
-          return rejectLogin('invalid_totp');
-        }
-      }
       validLogin = true;
     }
   } else if (expectedUserEnv && expectedPassEnv) {
@@ -125,18 +140,9 @@ app.post('/login', loginRateLimiter, asyncHandler(async (req, res) => {
   }
 
   if (validLogin) {
-    // A password/MFA change may have revoked these credentials during the bcrypt check.
-    const currentUser = getUserStmt.get();
-    if (Boolean(currentUser) !== Boolean(userRow) || (userRow &&
-      ['username', 'password_hash', 'totp_secret', 'totp_enabled'].some(field => currentUser[field] !== userRow[field]))) {
-      return rejectLogin();
-    }
-    const sessionToken = generateSessionToken();
-    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
-
-    insertSessionStmt.run(sessionToken, expiresAt);
-
-    setSessionCookie(res, sessionToken);
+    const result = createLoginSession.immediate(userRow, tokenInput);
+    if (result.error) return rejectLogin(result.error);
+    setSessionCookie(res, result.token);
 
     // Clear failed attempts on successful login
     if (req.loginAttemptsInfo && req.loginAttemptsInfo.ip) {
@@ -152,6 +158,7 @@ app.get('/logout', (req, res) => {
   const token = req.cookies.session;
   if (token) {
     deleteSessionStmt.run(token);
+    revokeSessionStreams(token);
   }
 
   res.clearCookie('session', { path: '/' });
@@ -172,10 +179,11 @@ app.post('/api/setup', asyncHandler(async (req, res) => {
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
-  const token = updateAuthentication(req.cookies.session, () => {
+  const token = updateAuthentication.immediate(req.cookies.session, () => {
     if (getUserStmt.get()) updateUserAuthStmt.run(newUsername, hash);
     else insertUserAuthStmt.run(newUsername, hash);
   });
+  revokeSessionStreams();
   setSessionCookie(res, token);
   res.json({ success: true });
 }));
@@ -192,25 +200,26 @@ app.post('/api/2fa/generate', asyncHandler(async (req, res) => {
 }));
 
 app.post('/api/2fa/verify', (req, res) => {
-  const { token, secret } = req.body;
-  let isValid = false;
-  try {
-    isValid = verifySync({ token, secret }).valid;
-  } catch (err) {
-    // Treat format/length errors as invalid
-  }
-
-  if (isValid) {
-    const sessionToken = updateAuthentication(req.cookies.session, () => updateTotpSecretStmt.run(secret));
-    setSessionCookie(res, sessionToken);
-    res.json({ success: true });
-  } else {
-    res.status(400).json({ error: 'Invalid token' });
-  }
+  const { token } = req.body;
+  const secret = typeof req.body.secret === 'string' ? req.body.secret.replace(/=+$/, '').toUpperCase() : req.body.secret;
+  const sessionToken = updateAuthentication.immediate(req.cookies.session, () => {
+    const user = getUserStmt.get();
+    const result = verifyTotp(token, req.body.secret, user?.totp_secret?.replace(/=+$/, '').toUpperCase() === secret ? user.totp_last_step : null);
+    if (!user || !result.valid) {
+      const error = new Error('Invalid token');
+      error.status = 400;
+      throw error;
+    }
+    updateTotpSecretStmt.run(secret, result.timeStep);
+  });
+  revokeSessionStreams();
+  setSessionCookie(res, sessionToken);
+  res.json({ success: true });
 });
 
 app.post('/api/2fa/disable', (req, res) => {
-  const token = updateAuthentication(req.cookies.session, () => disableTotpStmt.run());
+  const token = updateAuthentication.immediate(req.cookies.session, () => disableTotpStmt.run());
+  revokeSessionStreams();
   setSessionCookie(res, token);
   res.json({ success: true });
 });

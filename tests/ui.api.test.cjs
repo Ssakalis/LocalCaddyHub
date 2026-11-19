@@ -100,10 +100,12 @@ test('branded forms save and reload through the authenticated API and real SQLit
   await page.fill('#l4_td', 'exchange01.internal, exchange02.internal');
   await page.fill('#l4_tp', '25');
   await saveModal('layer4Modal');
+  const initialRevision = await page.evaluate(() => app.configRevision);
   const saved = page.waitForResponse(response => response.url().endsWith('/api/config/structured') && response.request().method() === 'POST');
   await page.click('#applyConfigBtn');
   const result = await saved;
-  assert.equal(result.status(), 200, await result.text());
+  assert.equal(result.status(), 200, result.status() === 200 ? undefined : await result.text());
+  assert.equal(result.request().headers()['if-match'], initialRevision);
   await page.reload();
   await page.waitForFunction(() => window.app?.configLoaded && app.config.domains.length === 1);
   const config = await page.evaluate(() => app.config);
@@ -114,5 +116,53 @@ test('branded forms save and reload through the authenticated API and real SQLit
   assert.equal(config.handlers[0].waf_profile, 'exchange');
   assert.equal(config.handlers[0].waf_body_limit_mb, 128);
   assert.equal(config.handlers[0].lb_policy, 'ip_hash');
+
+  const loadedRevision = await page.evaluate(() => app.configRevision);
+  const current = await page.request.get(origin + '/api/config/structured');
+  assert.equal(current.headers().etag, loadedRevision);
+  const otherDraft = await current.json();
+  otherDraft.general.log_level = 'ERROR';
+  const otherSave = await page.request.post(origin + '/api/config/structured', {
+    headers: { 'X-Requested-With': 'XMLHttpRequest', 'If-Match': loadedRevision }, data: otherDraft
+  });
+  assert.equal(otherSave.status(), 200);
+  await page.fill('#genHttpPort', '9088');
+  await page.evaluate(() => { app.config.domains[0].description = 'Unsaved local draft'; });
+  const rejected = page.waitForResponse(response => response.url().endsWith('/api/config/structured') && response.request().method() === 'POST');
+  await page.click('#applyConfigBtn');
+  assert.equal((await rejected).status(), 412);
+  await page.waitForFunction(() => document.querySelector('#globalStatus').textContent.includes('Configuration changed'), undefined, { timeout: 5000 });
+  assert.equal(await page.evaluate(() => app.configRevision), loadedRevision);
+  assert.equal(await page.evaluate(() => app.config.domains[0].description), 'Unsaved local draft');
+  assert.equal(await page.inputValue('#genHttpPort'), '9088');
+
+  const rawSave = await page.request.post(origin + '/api/config', {
+    headers: { 'X-Requested-With': 'XMLHttpRequest', 'If-Match': otherSave.headers().etag },
+    data: { content: '# browser raw configuration\n' }
+  });
+  assert.equal(rawSave.status(), 200);
+  await page.reload();
+  await page.waitForFunction(() => app.configLoaded && app.configMode === 'raw');
+  const rawRevision = await page.evaluate(() => app.configRevision);
+  let replacementRequests = 0;
+  const countReplacements = request => { if (request.method() === 'POST' && request.url().endsWith('/api/config/structured')) replacementRequests++; };
+  page.on('request', countReplacements);
+  const cancelDialog = page.waitForEvent('dialog');
+  const cancelApply = page.click('#applyConfigBtn');
+  const warning = await cancelDialog;
+  assert.match(warning.message(), /replace.*raw/i);
+  await warning.dismiss();
+  await cancelApply;
+  assert.equal(replacementRequests, 0);
+  assert.equal(await page.evaluate(() => app.configRevision), rawRevision);
+  page.off('request', countReplacements);
+  const accepted = page.waitForResponse(response => response.url().endsWith('/api/config/structured') && response.request().method() === 'POST');
+  page.once('dialog', dialog => dialog.accept());
+  await page.click('#applyConfigBtn');
+  const replacement = await accepted;
+  assert.equal(replacement.status(), 200);
+  assert.equal(replacement.request().headers()['if-match'], rawRevision);
+  assert.equal(replacement.request().headers()['x-config-mode'], 'structured');
+  await page.waitForFunction(revision => app.configMode === 'structured' && app.configRevision !== revision, rawRevision, { timeout: 5000 });
   assert.deepEqual(errors, []);
 });

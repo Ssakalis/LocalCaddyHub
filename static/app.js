@@ -22,6 +22,9 @@ const app = {
         layer4: []
     },
     configLoaded: false,
+    configRevision: null,
+    configMode: null,
+    configDraftNotice: 'Your local draft is preserved. Copy your unsaved edits before reloading and reconciling the configuration.',
     certs: [],
     pfxCertificates: [],
     missingCertReferences: [],
@@ -82,7 +85,14 @@ const app = {
             const res = await fetch('/api/config/structured');
             if (res.ok) {
                 const data = await res.json();
+                const revision = res.headers.get('ETag');
+                const mode = res.headers.get('X-Config-Mode');
+                if (!revision || revision.startsWith('W/') || !['raw', 'structured'].includes(mode)) {
+                    throw new Error('Missing configuration revision or mode');
+                }
                 this.config = Object.assign(this.config, data);
+                this.configRevision = revision;
+                this.configMode = mode;
                 this.configLoaded = true;
                 $('#applyConfigBtn').prop('disabled', false);
                 this.ui.renderGeneral();
@@ -102,6 +112,22 @@ const app = {
                 $('#configLoadError').text(this.t('Configuration could not be loaded. Reload the page to retry.')).show();
             }
         }
+    },
+
+    configWriteHeaders: function() {
+        if (!this.configLoaded || !this.configRevision) {
+            throw new Error(this.t('Configuration revision is missing. Reload the page before changing configuration.') + ' ' + this.t(this.configDraftNotice));
+        }
+        return { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'If-Match': this.configRevision };
+    },
+
+    configWriteError: function(res) {
+        const messages = {
+            409: 'The active configuration is in raw mode. Reload and explicitly confirm replacing the raw Caddyfile to apply structured settings.',
+            412: 'Configuration changed on the server. Reload and reconcile before saving again.',
+            428: 'Configuration revision is missing. Reload before changing configuration.'
+        };
+        return messages[res.status] ? this.t(messages[res.status]) + ' ' + this.t(this.configDraftNotice) : '';
     },
 
     collectGeneralConfigFromForm: function() {
@@ -127,7 +153,7 @@ const app = {
     },
 
     saveStructuredConfig: async function() {
-        if (!this.configLoaded) {
+        if (!this.configLoaded || !this.configRevision) {
             this.showStatus('Configuration could not be loaded. Reload the page to retry.', 'danger');
             return false;
         }
@@ -137,6 +163,8 @@ const app = {
             generalForm.reportValidity();
             return false;
         }
+        const replacingRaw = this.configMode === 'raw';
+        if (replacingRaw && !confirm(this.t('Apply structured settings and replace the active raw Caddyfile? Raw-only directives will be lost.'))) return false;
         const btn = $('#applyConfigBtn');
         const originalText = btn.html();
         btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ' + this.t('Saving...'));
@@ -146,7 +174,7 @@ const app = {
         try {
             const res = await fetch('/api/config/structured', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                headers: { ...this.configWriteHeaders(), ...(replacingRaw ? { 'X-Config-Mode': 'structured' } : {}) },
                 body: JSON.stringify(this.config)
             });
             if (res.ok) {
@@ -154,7 +182,7 @@ const app = {
                 await this.loadConfig(); // Refresh raw caddyfile
                 return true;
             } else {
-                this.showStatus('Failed to save config.', 'danger');
+                this.showStatus(this.configWriteError(res) || 'Failed to save config.', 'danger');
                 return false;
             }
         } catch (e) {
@@ -441,12 +469,12 @@ const app = {
                 const message = `${this.t('Certificate {name} is still referenced by the configuration.', { name: filename })}\n\n${details}\n\n${this.t('Remove these references and delete the file?')}`;
                 if (!confirm(message)) return;
 
-                const cleanupRes = await fetch(`/api/certs?file=${encodeURIComponent(filename)}&removeReferences=1`, { method: 'DELETE', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
-                if (!cleanupRes.ok) throw new Error(await cleanupRes.text());
-                await this.loadConfig();
+                const cleanupRes = await fetch(`/api/certs?file=${encodeURIComponent(filename)}&removeReferences=1`, { method: 'DELETE', headers: this.configWriteHeaders() });
+                if (!cleanupRes.ok) throw new Error(this.configWriteError(cleanupRes) || await cleanupRes.text());
                 await this.loadCerts();
                 await this.loadPfxCertificates();
                 await this.loadMissingCertificateReferences();
+                alert(this.t('Certificate deleted and references removed.') + ' ' + this.t(this.configDraftNotice));
             } else {
                 alert(this.t('Failed to delete cert.'));
             }
@@ -508,15 +536,14 @@ const app = {
         try {
             const res = await fetch('/api/certs/references/cleanup', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                headers: this.configWriteHeaders(),
                 body: JSON.stringify({})
             });
-            if (!res.ok) throw new Error(await res.text());
-            await this.loadConfig();
+            if (!res.ok) throw new Error(this.configWriteError(res) || await res.text());
             await this.loadCerts();
             await this.loadPfxCertificates();
             await this.loadMissingCertificateReferences();
-            $('#certReferenceStatus').text(this.t('Missing certificate references removed.')).removeClass('text-danger').addClass('text-success').show();
+            $('#certReferenceStatus').text(this.t('Missing certificate references removed.') + ' ' + this.t(this.configDraftNotice)).removeClass('text-danger').addClass('text-success').show();
         } catch (e) {
             $('#certReferenceStatus').text(this.t('Error: ') + e.message).removeClass('text-success').addClass('text-danger').show();
         } finally {
@@ -587,16 +614,15 @@ const app = {
         try {
             const res = await fetch('/api/certs/letsencrypt/renew-all-rsa', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                headers: this.configWriteHeaders(),
                 body: JSON.stringify({})
             });
             const data = await res.json();
             if (!res.ok || data.error) {
-                throw new Error(data.error || data.stderr || this.t('Renewal failed.'));
+                throw new Error(this.configWriteError(res) || data.error || data.stderr || this.t('Renewal failed.'));
             }
             const message = [data.output, data.stderr].filter(Boolean).join('\n');
-            $('#certRenewStatus').text(this.t(message || 'Automatic renewal checked.')).removeClass('text-danger').addClass('text-success').show();
-            await this.loadConfig();
+            $('#certRenewStatus').text(this.t(message || 'Automatic renewal checked.') + ' ' + this.t(this.configDraftNotice)).removeClass('text-danger').addClass('text-success').show();
             await this.loadPfxCertificates();
             this.pollLetsEncryptStatus(0, message);
         } catch (e) {

@@ -98,6 +98,111 @@ function ntlmToken(type, user) {
   return 'NTLM ' + Buffer.concat([signature, Buffer.from(user)]).toString('base64');
 }
 
+test('proxy: access lists reject before proxying or redirects without changing routing, auth or WAF', { timeout: 30000 }, async t => {
+  const dir = temporaryDirectory(t);
+  let forwarded = 0;
+  const backend = http.createServer((req, res) => { forwarded++; res.end(req.url); });
+  const backendPort = await listen(backend);
+  t.after(() => stop(backend));
+  const port = await freePort();
+  const cfg = config(port, backendPort, { toDomain: ['127.0.0.1'] });
+  cfg.accessLists = [
+    { id: 'allow', clientIps: ['127.0.0.1/32'], request_matcher: 'remote_ip', http_response_code: '403' },
+    { id: 'deny', clientIps: ['203.0.113.0/24'], request_matcher: 'client_ip', http_response_code: '403', http_response_message: 'ACL denied' },
+    { id: 'abort', clientIps: ['203.0.113.0/24'], request_matcher: 'remote_ip' }
+  ];
+  cfg.basicAuths = [{ id: 'auth', basicauthuser: 'acl-user', basicauthpass: require('bcrypt').hashSync('acl-password', 4) }];
+  const authorization = 'Basic ' + Buffer.from('acl-user:acl-password').toString('base64');
+  cfg.domains[0].accesslist = ['allow'];
+  cfg.domains[0].basicauth = ['auth'];
+  cfg.domains.push(
+    { ...cfg.domains[0], id: 'blocked', fromDomain: 'blocked.example.test', accesslist: ['deny'], basicauth: [] },
+    { ...cfg.domains[0], id: 'aborted', fromDomain: 'aborted.example.test', accesslist: ['abort'], basicauth: [] },
+    { ...cfg.domains[0], id: 'handler', fromDomain: 'handler.example.test', accesslist: [], basicauth: [] }
+  );
+  cfg.subdomains = [
+    { id: 'inherited-allow', enabled: true, reverse: 'mail', fromDomain: 'inherited' },
+    { id: 'inherited-deny', enabled: true, reverse: 'blocked', fromDomain: 'inherited' },
+    { id: 'inherited-abort', enabled: true, reverse: 'aborted', fromDomain: 'inherited' },
+    { id: 'additional-deny', enabled: true, reverse: 'mail', fromDomain: 'restricted', accesslist: ['deny'] }
+  ];
+  const base = cfg.handlers[0];
+  cfg.handlers = [];
+  for (const site of [...cfg.domains, ...cfg.subdomains]) {
+    const owner = cfg.subdomains.includes(site) ? { reverse: site.reverse, subdomain: site.id } : { reverse: site.id };
+    // Broad handler first catches regressions that accidentally disable Caddy's path sorting.
+    for (const [suffix, handleType, handlePath] of [
+      ['fallback', 'handle', '/*'], ['keep', 'handle', '/keep/*'], ['strip', 'handle_path', '/strip/*']
+    ]) cfg.handlers.push({ ...base, ...owner, id: `${site.id}-${suffix}`, handleType, handlePath });
+  }
+  for (const [id, handleType, handlePath, accesslist, handleDirective] of [
+    ['denied', 'handle', '/denied/*', ['deny'], 'reverse_proxy'],
+    ['strip-denied', 'handle_path', '/strip-denied/*', ['deny'], 'reverse_proxy'],
+    ['aborted', 'handle', '/aborted/*', ['abort'], 'reverse_proxy'],
+    ['strip-aborted', 'handle_path', '/strip-aborted/*', ['abort'], 'reverse_proxy'],
+    ['redirect-denied', 'handle', '/redirect-denied/*', ['deny'], 'redir'],
+    ['redirect-aborted', 'handle', '/redirect-aborted/*', ['abort'], 'redir'],
+    ['redirect-allowed', 'handle', '/redirect-allowed/*', ['allow'], 'redir'],
+    ['secure', 'handle', '/secure/*', ['allow'], 'reverse_proxy']
+  ]) cfg.handlers.push({ ...base, id, reverse: 'handler', handleType, handlePath, accesslist, handleDirective,
+    ...(handleDirective === 'redir' ? { toDomain: ['https://target.example.test'], redir_status: '302' } : {}),
+    ...(['secure', 'redirect-allowed'].includes(id) ? { basicauth: ['auth'], waf_enabled: true } : {}) });
+  await caddy(t, cfg, dir);
+
+  async function check(host, pathname, status, body, authenticated = true) {
+    const before = forwarded;
+    const result = await request(port, pathname, { headers: { Host: host, ...(authenticated ? { Authorization: authorization } : {}) } });
+    assert.equal(forwarded, before + (status === 200 ? 1 : 0), `${host}${pathname}: rejected requests must not reach the backend`);
+    assert.equal(result.status, status, `${host}${pathname}`);
+    if (body !== undefined) assert.equal(result.body, body);
+    return result;
+  }
+  async function checkAbort(host, pathname) {
+    const before = forwarded;
+    await assert.rejects(request(port, pathname, { headers: { Host: host } }), { code: 'ECONNRESET' });
+    assert.equal(forwarded, before, `${host}${pathname}: aborted requests must not reach the backend`);
+  }
+
+  await t.test('allowed clients retain path specificity and handle_path stripping', async () => {
+    for (const host of ['mail.example.test', 'inherited.mail.example.test', 'handler.example.test']) {
+      await check(host, '/keep/item?q=normal', 200, '/keep/item?q=normal');
+      await check(host, '/strip/item?q=normal', 200, '/item?q=normal');
+      await check(host, '/other/item', 200, '/other/item');
+    }
+  });
+  await t.test('domain and subdomain denials include inherited and additional lists', async () => {
+    for (const host of ['blocked.example.test', 'inherited.blocked.example.test', 'restricted.mail.example.test']) {
+      for (const pathname of ['/keep/item', '/strip/item']) await check(host, pathname, 403, 'ACL denied');
+    }
+  });
+  await t.test('domain aborts are inherited by subdomains', async () => {
+    for (const host of ['aborted.example.test', 'inherited.aborted.example.test']) {
+      for (const pathname of ['/keep/item', '/strip/item']) await checkAbort(host, pathname);
+    }
+  });
+  await t.test('handler denials run before reverse_proxy and redir', async () => {
+    for (const pathname of ['/denied/item', '/strip-denied/item', '/redirect-denied/item']) {
+      await check('handler.example.test', pathname, 403, 'ACL denied');
+    }
+  });
+  await t.test('handler aborts run before reverse_proxy and redir', async () => {
+    for (const pathname of ['/aborted/item', '/strip-aborted/item', '/redirect-aborted/item']) {
+      await checkAbort('handler.example.test', pathname);
+    }
+  });
+  await t.test('site, inherited and handler authentication and WAF remain enforced', async () => {
+    await check('mail.example.test', '/keep/item', 401, undefined, false);
+    await check('inherited.mail.example.test', '/strip/item', 401, undefined, false);
+    for (const pathname of ['/secure/item', '/redirect-allowed/item']) {
+      await check('handler.example.test', pathname, 401, undefined, false);
+      await check('handler.example.test', pathname + '?id=' + encodeURIComponent("1' OR '1'='1 --"), 403);
+    }
+    await check('handler.example.test', '/secure/item', 200, '/secure/item');
+    const redirect = await check('handler.example.test', '/redirect-allowed/item', 302);
+    assert.equal(redirect.headers.location, 'https://target.example.test');
+  });
+});
+
 test('proxy: NTLM handshake stays on one backend socket with separate concurrent clients', { timeout: 20000 }, async t => {
   const dir = temporaryDirectory(t);
   let socketCounter = 0;
@@ -395,8 +500,14 @@ test('proxy: actual API validation preserves SQLite and Caddyfile after real Cad
   const base = `http://127.0.0.1:${port}`;
   await until(async () => { if (app.exitCode !== null) assert.fail(output); try { return (await fetch(base + '/login.html')).ok; } catch { return false; } }, 'Actual API did not start');
   let cookie;
-  const api = (endpoint, body) => fetch(base + endpoint, { ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
-    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...(cookie ? { Cookie: cookie } : {}) } });
+  const api = async (endpoint, body) => {
+    const headers = { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...(cookie ? { Cookie: cookie } : {}) };
+    if (body && endpoint.startsWith('/api/config')) {
+      const current = await fetch(base + '/api/config/structured', { headers });
+      headers['If-Match'] = current.headers.get('etag');
+    }
+    return fetch(base + endpoint, { ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}), headers });
+  };
   const login = await api('/login', { username: 'bootstrap-api', password: 'bootstrap-api-secret' });
   assert.equal(login.status, 200); cookie = login.headers.get('set-cookie').split(';')[0];
   const setup = await api('/api/setup', { newUsername: 'api-operator', newPassword: 'api-validation-secret' });
@@ -410,7 +521,7 @@ test('proxy: actual API validation preserves SQLite and Caddyfile after real Cad
   const Database = require(path.join(root, 'node_modules/better-sqlite3'));
   const db = new Database(path.join(dir, 'caddyhub.db'), { readonly: true });
   t.after(() => db.close());
-  const snapshot = () => ['general_config', 'domains', 'subdomains', 'handlers', 'access_lists', 'basic_auths', 'headers', 'layer4']
+  const snapshot = () => ['general_config', 'domains', 'subdomains', 'handlers', 'access_lists', 'basic_auths', 'headers', 'layer4', 'config_state']
     .map(table => db.prepare(`SELECT * FROM ${table} ORDER BY id`).all());
   const records = snapshot();
   const invalidRaw = await api('/api/config', { content: '{\ninvalid_global_directive yes\n}\n' });
