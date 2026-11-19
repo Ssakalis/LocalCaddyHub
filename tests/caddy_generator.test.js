@@ -24,6 +24,18 @@ describe('generateCaddyfile UI parity', () => {
       assert.throws(() => generateCaddyfile({ general: { enabled: true }, domains: [{ id: 'd', enabled: true, fromDomain: 'mail.example.test', [field]: ['missing'] }] }), /Unknown/);
     }
   });
+  test('keeps site and handler access denials ahead of nested routing', () => {
+    const config = generateCaddyfile({
+      general: { enabled: true },
+      domains: [{ id: 'mail', enabled: true, fromDomain: 'mail.example.test', accesslist: ['deny'] }],
+      accessLists: [{ id: 'deny', clientIps: ['203.0.113.0/24'], http_response_code: '403' }],
+      handlers: [{ id: 'redirect', enabled: true, reverse: 'mail', handlePath: '/*',
+        handleDirective: 'redir', toDomain: ['https://example.test'], accesslist: ['deny'] }]
+    });
+    const site = blockFor(config, 'https://mail.example.test:443');
+    assert.match(site, /route \{\n\t+@al_domain_deny[^\n]*\n\t+respond @al_domain_deny 403\n\t+handle \{/);
+    assert.match(site, /route \{\n\t+@al_h_redirect_deny[^\n]*\n\t+respond @al_h_redirect_deny 403\n\t+redir https:\/\/example\.test 301/);
+  });
   test('resolves every supported certificate extension to its matching key', () => {
     for (const filename of ['exchange.CRT', 'exchange.cer', 'exchange.PEM']) {
       const config = generateCaddyfile({ general: { enabled: true, enable_layer4: true },

@@ -531,7 +531,7 @@ function generateCaddyfile(config, certsDir = './certs', instanceLogsDir = path.
     }
   }
 
-  function writeProxyTransport(handler) {
+  function writeProxyTransport(handler, indent) {
     const transportName = handler.ntlm ? 'http_ntlm' : 'http';
     const tlsEnabled = Boolean(
       handler.httpTls ||
@@ -545,29 +545,29 @@ function generateCaddyfile(config, certsDir = './certs', instanceLogsDir = path.
 
     if (!needsTransport) return;
 
-    sb += `\t\t\ttransport ${transportName} {\n`;
+    sb += `${indent}transport ${transportName} {\n`;
     if (tlsEnabled) {
-      sb += '\t\t\t\ttls\n';
+      sb += `${indent}\ttls\n`;
       if (handler.http_tls_insecure_skip_verify) {
-        sb += '\t\t\t\ttls_insecure_skip_verify\n';
+        sb += `${indent}\ttls_insecure_skip_verify\n`;
       }
       if (handler.http_tls_server_name) {
-        sb += `\t\t\t\ttls_server_name ${handler.http_tls_server_name}\n`;
+        sb += `${indent}\ttls_server_name ${handler.http_tls_server_name}\n`;
       }
       if (handler.http_tls_trusted_ca_certs) {
-        sb += `\t\t\t\ttls_trust_pool file ${certPath(handler.http_tls_trusted_ca_certs)}\n`;
+        sb += `${indent}\ttls_trust_pool file ${certPath(handler.http_tls_trusted_ca_certs)}\n`;
       }
     }
     if (versions) {
-      sb += `\t\t\t\tversions ${versions}\n`;
+      sb += `${indent}\tversions ${versions}\n`;
     }
     if (keepalive) {
-      sb += `\t\t\t\tkeepalive ${keepalive}\n`;
+      sb += `${indent}\tkeepalive ${keepalive}\n`;
     }
-    sb += '\t\t\t}\n';
+    sb += `${indent}}\n`;
   }
 
-  function writeHandlers(handlers) {
+  function writeHandlers(handlers, indent = '\t') {
     if (!handlers || handlers.length === 0) return;
 
     for (const handler of handlers) {
@@ -575,45 +575,48 @@ function generateCaddyfile(config, certsDir = './certs', instanceLogsDir = path.
       const directive = handler.handleDirective || 'reverse_proxy';
 
       if (handler.handleType === 'handle_path') {
-        sb += `\thandle_path${matcherStr} {\n`;
+        sb += `${indent}handle_path${matcherStr} {\n`;
       } else {
-        sb += `\thandle${matcherStr} {\n`;
+        sb += `${indent}handle${matcherStr} {\n`;
       }
 
+      sb += `${indent}\troute {\n`;
+      const bodyIndent = `${indent}\t\t`;
+
       if (handler.waf_enabled) {
-        sb += '\t\tcoraza_waf {\n';
-        sb += '\t\t\tload_owasp_crs\n';
-        sb += '\t\t\tdirectives `\n';
-        sb += '\t\t\t\tInclude @coraza.conf-recommended\n';
+        sb += `${bodyIndent}coraza_waf {\n`;
+        sb += `${bodyIndent}\tload_owasp_crs\n`;
+        sb += `${bodyIndent}\tdirectives \`\n`;
+        sb += `${bodyIndent}\t\tInclude @coraza.conf-recommended\n`;
           const bodyLimit = Number(handler.waf_body_limit_mb) || (handler.waf_profile === 'exchange' ? 128 : 0);
-          if (bodyLimit) sb += `\t\t\t\tSecRequestBodyLimit ${bodyLimit * 1024 * 1024}\n`;
-        sb += '\t\t\t\tInclude @crs-setup.conf.example\n';
+          if (bodyLimit) sb += `${bodyIndent}\t\tSecRequestBodyLimit ${bodyLimit * 1024 * 1024}\n`;
+        sb += `${bodyIndent}\t\tInclude @crs-setup.conf.example\n`;
           if (handler.waf_profile === 'exchange') {
-            sb += '\t\t\t\tSecRule REQUEST_URI "@rx (?i)^/EWS/Exchange[.]asmx(?:\\?|$)" "id:1001010,phase:1,pass,nolog,chain"\n';
-            sb += '\t\t\t\tSecRule REQUEST_HEADERS:Content-Type "@rx (?i)^(?:text/xml|application/(?:xml|soap\\+xml))(?:\\s*;|$)" "ctl:requestBodyProcessor=EXCHANGE_XML"\n';
+            sb += `${bodyIndent}\t\tSecRule REQUEST_URI "@rx (?i)^/EWS/Exchange[.]asmx(?:\\?|$)" "id:1001010,phase:1,pass,nolog,chain"\n`;
+            sb += `${bodyIndent}\t\tSecRule REQUEST_HEADERS:Content-Type "@rx (?i)^(?:text/xml|application/(?:xml|soap\\+xml))(?:\\s*;|$)" "ctl:requestBodyProcessor=EXCHANGE_XML"\n`;
             // Keep CRS inspection; allow protocol MIME types only on their matching Exchange paths.
             for (const [endpoint, mime] of [
               ['mapi', 'mapi-http'], ['Microsoft-Server-ActiveSync', 'vnd\\.ms-sync\\.wbxml'], ['rpc', 'rpc']
             ]) {
               const ruleId = 1001000 + ['mapi', 'Microsoft-Server-ActiveSync', 'rpc'].indexOf(endpoint);
               const route = endpoint === 'rpc' ? 'rpc/rpcproxy[.]dll' : endpoint;
-              sb += `\t\t\t\tSecRule REQUEST_URI "@rx (?i)^/${route}(?:/|\\?|$)" "id:${ruleId},phase:1,pass,nolog,chain"\n`;
+              sb += `${bodyIndent}\t\tSecRule REQUEST_URI "@rx (?i)^/${route}(?:/|\\?|$)" "id:${ruleId},phase:1,pass,nolog,chain"\n`;
               const rpc = endpoint === 'rpc';
-              sb += `\t\t\t\tSecRule REQUEST_HEADERS:Content-Type "@rx (?i)^application/${mime}(?:\\s*;|$)" "ctl:ruleRemoveById=920420,ctl:requestBodyProcessor=RAW${rpc ? ',ctl:ruleRemoveById=920440,chain' : ''}"\n`;
-              if (rpc) sb += '\t\t\t\tSecRule REQUEST_METHOD "@rx ^RPC_(?:IN|OUT)_DATA$" "ctl:ruleRemoveById=911100"\n';
+              sb += `${bodyIndent}\t\tSecRule REQUEST_HEADERS:Content-Type "@rx (?i)^application/${mime}(?:\\s*;|$)" "ctl:ruleRemoveById=920420,ctl:requestBodyProcessor=RAW${rpc ? ',ctl:ruleRemoveById=920440,chain' : ''}"\n`;
+              if (rpc) sb += `${bodyIndent}\t\tSecRule REQUEST_METHOD "@rx ^RPC_(?:IN|OUT)_DATA$" "ctl:ruleRemoveById=911100"\n`;
             }
           }
-        sb += '\t\t\t\tInclude @owasp_crs/*.conf\n';
-        sb += '\t\t\t\tSecRuleEngine On\n';
-        sb += '\t\t\t`\n';
-        sb += '\t\t}\n';
+        sb += `${bodyIndent}\t\tInclude @owasp_crs/*.conf\n`;
+        sb += `${bodyIndent}\t\tSecRuleEngine On\n`;
+        sb += `${bodyIndent}\t\`\n`;
+        sb += `${bodyIndent}}\n`;
       }
 
-      writeAccessRules(handler.accesslist, '\t\t', `al_h_${handler.id}`);
-      writeBasicAuths(handler.basicauth, '\t\t');
+      writeAccessRules(handler.accesslist, bodyIndent, `al_h_${handler.id}`);
+      writeBasicAuths(handler.basicauth, bodyIndent);
 
       if (directive === 'reverse_proxy') {
-        sb += '\t\treverse_proxy';
+        sb += `${bodyIndent}reverse_proxy`;
         if (handler.toDomain) {
           for (const to of handler.toDomain) {
             sb += ` ${to}:${handler.toPort}`;
@@ -622,56 +625,57 @@ function generateCaddyfile(config, certsDir = './certs', instanceLogsDir = path.
         sb += ' {\n';
 
         if (handler.to_path) {
-          sb += `\t\t\trewrite ${handler.to_path}\n`;
+          sb += `${bodyIndent}\trewrite ${handler.to_path}\n`;
         }
 
         if (handler.header) {
           for (const hID of handler.header) {
-            writeProxyHeader(headersMap[hID], '\t\t\t');
+            writeProxyHeader(headersMap[hID], `${bodyIndent}\t`);
           }
         }
 
-        writeProxyTransport(handler);
+        writeProxyTransport(handler, `${bodyIndent}\t`);
 
         const lbPolicy = handler.ntlm && handler.toDomain && handler.toDomain.length > 1 ? 'ip_hash' : handler.lb_policy;
-        if (lbPolicy) sb += `\t\t\tlb_policy ${lbPolicy}\n`;
-        if (handler.lb_retries) sb += `\t\t\tlb_retries ${parseInt(handler.lb_retries, 10)}\n`;
-        if (handler.lb_try_duration) sb += `\t\t\tlb_try_duration ${formatDuration(handler.lb_try_duration)}\n`;
-        if (handler.lb_try_interval) sb += `\t\t\tlb_try_interval ${formatDuration(handler.lb_try_interval)}\n`;
+        if (lbPolicy) sb += `${bodyIndent}\tlb_policy ${lbPolicy}\n`;
+        if (handler.lb_retries) sb += `${bodyIndent}\tlb_retries ${parseInt(handler.lb_retries, 10)}\n`;
+        if (handler.lb_try_duration) sb += `${bodyIndent}\tlb_try_duration ${formatDuration(handler.lb_try_duration)}\n`;
+        if (handler.lb_try_interval) sb += `${bodyIndent}\tlb_try_interval ${formatDuration(handler.lb_try_interval)}\n`;
 
-        if (handler.health_uri) sb += `\t\t\thealth_uri ${handler.health_uri}\n`;
-        if (handler.health_port) sb += `\t\t\thealth_port ${handler.health_port}\n`;
-        if (handler.health_interval) sb += `\t\t\thealth_interval ${formatDuration(handler.health_interval)}\n`;
-        if (handler.health_timeout) sb += `\t\t\thealth_timeout ${formatDuration(handler.health_timeout)}\n`;
-        if (handler.health_status) sb += `\t\t\thealth_status ${handler.health_status}\n`;
-        if (handler.health_body) sb += `\t\t\thealth_body ${caddyQuote(handler.health_body)}\n`;
-        if (handler.health_passes) sb += `\t\t\thealth_passes ${parseInt(handler.health_passes, 10)}\n`;
-        if (handler.health_fails) sb += `\t\t\thealth_fails ${parseInt(handler.health_fails, 10)}\n`;
-        if (handler.health_follow_redirects) sb += '\t\t\thealth_follow_redirects\n';
+        if (handler.health_uri) sb += `${bodyIndent}\thealth_uri ${handler.health_uri}\n`;
+        if (handler.health_port) sb += `${bodyIndent}\thealth_port ${handler.health_port}\n`;
+        if (handler.health_interval) sb += `${bodyIndent}\thealth_interval ${formatDuration(handler.health_interval)}\n`;
+        if (handler.health_timeout) sb += `${bodyIndent}\thealth_timeout ${formatDuration(handler.health_timeout)}\n`;
+        if (handler.health_status) sb += `${bodyIndent}\thealth_status ${handler.health_status}\n`;
+        if (handler.health_body) sb += `${bodyIndent}\thealth_body ${caddyQuote(handler.health_body)}\n`;
+        if (handler.health_passes) sb += `${bodyIndent}\thealth_passes ${parseInt(handler.health_passes, 10)}\n`;
+        if (handler.health_fails) sb += `${bodyIndent}\thealth_fails ${parseInt(handler.health_fails, 10)}\n`;
+        if (handler.health_follow_redirects) sb += `${bodyIndent}\thealth_follow_redirects\n`;
         if (handler.health_headers && handler.health_headers.length > 0) {
-          sb += '\t\t\thealth_headers {\n';
+          sb += `${bodyIndent}\thealth_headers {\n`;
           for (const hID of handler.health_headers) {
             const h = headersMap[hID];
             if (!h || !h.headerType || !h.headerValue) continue;
-            sb += `\t\t\t\t${h.headerType} ${caddyQuote(h.headerValue)}\n`;
+            sb += `${bodyIndent}\t\t${h.headerType} ${caddyQuote(h.headerValue)}\n`;
           }
-          sb += '\t\t\t}\n';
+          sb += `${bodyIndent}\t}\n`;
         }
 
-        if (handler.passive_health_fail_duration) sb += `\t\t\tfail_duration ${formatDuration(handler.passive_health_fail_duration)}\n`;
-        if (handler.passive_health_max_fails) sb += `\t\t\tmax_fails ${parseInt(handler.passive_health_max_fails, 10)}\n`;
-        if (handler.passive_health_unhealthy_status) sb += `\t\t\tunhealthy_status ${handler.passive_health_unhealthy_status}\n`;
-        if (handler.passive_health_unhealthy_latency) sb += `\t\t\tunhealthy_latency ${formatDuration(handler.passive_health_unhealthy_latency)}\n`;
-        if (handler.passive_health_unhealthy_request_count) sb += `\t\t\tunhealthy_request_count ${parseInt(handler.passive_health_unhealthy_request_count, 10)}\n`;
+        if (handler.passive_health_fail_duration) sb += `${bodyIndent}\tfail_duration ${formatDuration(handler.passive_health_fail_duration)}\n`;
+        if (handler.passive_health_max_fails) sb += `${bodyIndent}\tmax_fails ${parseInt(handler.passive_health_max_fails, 10)}\n`;
+        if (handler.passive_health_unhealthy_status) sb += `${bodyIndent}\tunhealthy_status ${handler.passive_health_unhealthy_status}\n`;
+        if (handler.passive_health_unhealthy_latency) sb += `${bodyIndent}\tunhealthy_latency ${formatDuration(handler.passive_health_unhealthy_latency)}\n`;
+        if (handler.passive_health_unhealthy_request_count) sb += `${bodyIndent}\tunhealthy_request_count ${parseInt(handler.passive_health_unhealthy_request_count, 10)}\n`;
 
-        sb += '\t\t}\n';
+        sb += `${bodyIndent}}\n`;
       } else if (directive === 'redir') {
         const to = handler.toDomain && handler.toDomain.length > 0 ? handler.toDomain[0] : '';
         const status = handler.redir_status || '301';
-        sb += `\t\tredir ${to} ${status}\n`;
+        sb += `${bodyIndent}redir ${to} ${status}\n`;
       }
 
-      sb += '\t}\n';
+      sb += `${indent}\t}\n`;
+      sb += `${indent}}\n`;
     }
   }
 
@@ -747,9 +751,17 @@ function generateCaddyfile(config, certsDir = './certs', instanceLogsDir = path.
 
     const accessIds = site === domain ? site.accesslist : mergeIdLists(domain.accesslist, site.accesslist);
     const authIds = site === domain ? site.basicauth : mergeIdLists(domain.basicauth, site.basicauth);
-    writeAccessRules(accessIds, '\t', site === domain ? 'al_domain' : `al_sub_${site.id}`);
     writeBasicAuths(authIds, '\t');
-    writeHandlers(handlers);
+    if (accessIds && accessIds.length > 0) {
+      // Keep denials before dispatch, while handle retains Caddy's path sorting.
+      sb += '\troute {\n';
+      writeAccessRules(accessIds, '\t\t', site === domain ? 'al_domain' : `al_sub_${site.id}`);
+      sb += '\t\thandle {\n';
+      writeHandlers(handlers, '\t\t\t');
+      sb += '\t\t}\n\t}\n';
+    } else {
+      writeHandlers(handlers);
+    }
     sb += '}\n\n';
   }
 
